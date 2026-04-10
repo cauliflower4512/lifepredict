@@ -1,4 +1,4 @@
-export const runtime = 'edge'
+export const runtime = 'nodejs'
 import { NextResponse } from 'next/server'
 
 /* ===== 五行（内部用） ===== */
@@ -63,12 +63,19 @@ export async function POST(req: Request) {
   try {
     const { birthDate, birthTime, background, recent } = await req.json()
 
+    if (!birthDate || !background || !recent) {
+      return NextResponse.json(
+        { result: "缺少必要参数" },
+        { status: 400 }
+      )
+    }
+
     const element = getWuXing(birthDate)
     const trait = getWuXingTrait(element)
 
     const hour = birthTime
       ? parseInt(birthTime.split(':')[0])
-      : 12 // 默认中午
+      : 12
 
     const shiTrait = getShiChenTrait(hour)
 
@@ -113,6 +120,9 @@ ${logic}
 现在直接开始。
 `
 
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 20000)
+
     const res = await fetch(
       "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
       {
@@ -124,18 +134,40 @@ ${logic}
         body: JSON.stringify({
           model: "doubao-seed-2-0-pro-260215",
           messages: [{ role: "user", content: prompt }]
-        })
+        }),
+        signal: controller.signal
       }
     )
+
+    clearTimeout(timeout)
+
+    if (!res.ok) {
+      const errorText = await res.text()
+      console.error("Doubao API error:", res.status, errorText)
+      return NextResponse.json(
+        { result: `上游接口报错：${res.status}` },
+        { status: 500 }
+      )
+    }
 
     const data = await res.json()
 
     return NextResponse.json({
       result: data.choices?.[0]?.message?.content || "生成失败"
     })
+  } catch (error: any) {
+    console.error("Generate route error:", error)
 
-  } catch (error) {
-    console.error(error)
-    return NextResponse.json({ result: "出错了" })
+    if (error?.name === "AbortError") {
+      return NextResponse.json(
+        { result: "请求超时，请重试" },
+        { status: 504 }
+      )
+    }
+
+    return NextResponse.json(
+      { result: "服务器出错了" },
+      { status: 500 }
+    )
   }
 }
