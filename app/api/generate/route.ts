@@ -1,5 +1,4 @@
 export const runtime = 'nodejs'
-import { NextResponse } from 'next/server'
 
 /* ===== 五行（内部用） ===== */
 function getWuXing(birthDate: string) {
@@ -36,8 +35,13 @@ function getShiChenTrait(hour: number) {
   return "更容易在变化中做决定"
 }
 
-/* ===== 推理底稿（核心升级） ===== */
-function buildLogic(trait: string, shiTrait: string, background: string, recent: string) {
+/* ===== 推理底稿 ===== */
+function buildLogic(
+  trait: string,
+  shiTrait: string,
+  background: string,
+  recent: string
+) {
   return `
 这个人现在的人生，是在一条已经形成的轨道上继续往前走的。
 
@@ -58,29 +62,23 @@ ${recent}
 `
 }
 
-/* ===== 主函数 ===== */
 export async function POST(req: Request) {
   try {
     const { birthDate, birthTime, background, recent } = await req.json()
 
     if (!birthDate || !background || !recent) {
-      return NextResponse.json(
-        { result: "缺少必要参数" },
-        { status: 400 }
-      )
+      return new Response("缺少必要参数", { status: 400 })
     }
 
     const element = getWuXing(birthDate)
     const trait = getWuXingTrait(element)
 
-    const hour = birthTime
-      ? parseInt(birthTime.split(':')[0])
-      : 12
-
+    const hour = birthTime ? parseInt(birthTime.split(":")[0], 10) : 12
     const shiTrait = getShiChenTrait(hour)
 
     const logic = buildLogic(trait, shiTrait, background, recent)
 
+    // 先把长度缩短，先保证跑通
     const prompt = `
 你在看一个人的人生轨迹。
 
@@ -88,80 +86,99 @@ export async function POST(req: Request) {
 
 ${logic}
 
-你要做的是：
-顺着这个人的状态，慢慢往后讲他接下来会怎么变化。
-
-必须严格遵守：
-
-1. 不要写小说，不要编生活细节
-（禁止出现具体时间、地点、食物、对话）
-
-2. 不要分析腔
-（不要说“根据你的情况”“说明了”）
-
-3. 不要分点
-
-4. 只写一条往前走的路径
-
-5. 语气像人在慢慢讲
-
-6. 不要总结结尾
-
-7. 不要提五行、命理、时辰这些词
-
-8. 300字左右
+要求：
+自然表达，不要分点，不要出现“可能/也许/大概”，顺着时间慢慢往后讲。
+不要写具体生活细节，不要提五行、命理、时辰这些词。
+控制在300到500字。
 
 现在直接开始。
 `
 
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 20000)
-
-    const res = await fetch(
+    const upstream = await fetch(
       "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.DOUBAO_API_KEY}`
+          Authorization: `Bearer ${process.env.DOUBAO_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "doubao-seed-2-0-pro-260215",
-          messages: [{ role: "user", content: prompt }]
+          model: "doubao-seed-2-0-lite",
+          stream: true,
+          messages: [{ role: "user", content: prompt }],
         }),
-        signal: controller.signal
       }
     )
 
-    clearTimeout(timeout)
-
-    if (!res.ok) {
-      const errorText = await res.text()
-      console.error("Doubao API error:", res.status, errorText)
-      return NextResponse.json(
-        { result: `上游接口报错：${res.status}` },
-        { status: 500 }
-      )
+    if (!upstream.ok || !upstream.body) {
+      const errorText = await upstream.text()
+      console.error("Doubao upstream error:", upstream.status, errorText)
+      return new Response("上游接口报错", { status: 500 })
     }
 
-    const data = await res.json()
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder()
 
-    return NextResponse.json({
-      result: data.choices?.[0]?.message?.content || "生成失败"
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = upstream.body!.getReader()
+        let buffer = ""
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            buffer += decoder.decode(value, { stream: true })
+
+            const lines = buffer.split("\n")
+            buffer = lines.pop() || ""
+
+            for (const line of lines) {
+              const trimmed = line.trim()
+
+              if (!trimmed.startsWith("data:")) continue
+
+              const data = trimmed.replace(/^data:\s*/, "")
+
+              if (data === "[DONE]") {
+                controller.close()
+                return
+              }
+
+              try {
+                const json = JSON.parse(data)
+                const chunk =
+                  json.choices?.[0]?.delta?.content ||
+                  json.choices?.[0]?.message?.content ||
+                  ""
+
+                if (chunk) {
+                  controller.enqueue(encoder.encode(chunk))
+                }
+              } catch (err) {
+                console.error("Stream parse error:", err, data)
+              }
+            }
+          }
+
+          controller.close()
+        } catch (error) {
+          console.error("Stream forwarding error:", error)
+          controller.error(error)
+        }
+      },
     })
-  } catch (error: any) {
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    })
+  } catch (error) {
     console.error("Generate route error:", error)
-
-    if (error?.name === "AbortError") {
-      return NextResponse.json(
-        { result: "请求超时，请重试" },
-        { status: 504 }
-      )
-    }
-
-    return NextResponse.json(
-      { result: "服务器出错了" },
-      { status: 500 }
-    )
+    return new Response("服务器出错了", { status: 500 })
   }
 }
